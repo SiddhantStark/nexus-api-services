@@ -1,0 +1,19 @@
+name: nexus-v1-local
+services:
+  postgres:
+    image: postgres:15.16
+    environment:
+      POSTGRES_DB: nexus_local
+      POSTGRES_USER: ${DB_USERNAME:?Set DB_USERNAME in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set a nonempty DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - nexus_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d nexus_local"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+volumes:
+  nexus_postgres:
