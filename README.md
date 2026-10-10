@@ -1,25 +1,25 @@
 # Nexus Commerce backend
 
-V1 is a Java 21 / Spring Boot modular application backed by PostgreSQL. Payments are local simulations and never charge real money. Phase 1 establishes configuration, package boundaries and startup only. Registration/JWT, commerce endpoints, Flyway migrations and database integration fixtures are later phases.
+V1 is a Java 21 / Spring Boot application backed by PostgreSQL. Payments are local simulations and never charge real money. Phases 1–2 provide configuration, 14 mapped tables, Flyway migrations, restricted database roles and automated persistence tests. Authentication and business APIs begin in Phase 3.
 
 ## Prerequisites
 
-- Java 21 (select it explicitly; a different system Java may otherwise be used).
-- The checked-in Maven wrapper, pinned to Maven 3.9.16; first use downloads dependencies.
-- Docker with Compose for the local PostgreSQL service, or an isolated PostgreSQL 15.16 instance.
-- Existing React frontend normally served at `http://127.0.0.1:8443`; backend port 8080.
+- Java 21, selected explicitly; Maven wrapper 3.9.16 is included.
+- Docker Desktop running, with Compose. PostgreSQL 15.16 is used locally and in tests.
+- First build requires access to Maven Central and Docker Hub.
+- React normally uses `http://127.0.0.1:8443`; backend uses port 8080.
 
-The existing Spring Boot 4.1.1 pin is retained and verified through compilation. Spring AI and Bedrock are removed from V1. No AWS/AI credentials are required for startup.
+Spring Boot 4.1.1 manages Flyway 12.4.0 and Testcontainers 2.0.5. No AI or AWS credentials are required.
 
-## Local setup
+## Local setup: new database
 
 Run from `nexus-backend`:
 
 ```sh
 export JAVA_HOME=$(/usr/libexec/java_home -v 21) # macOS; select JDK 21 on other OSes
 cp .env.example .env
-# Edit .env and set a new local-only DB_PASSWORD before continuing.
-# Only source a local file you control; .env is ignored by Git.
+# Edit .env: choose three DIFFERENT random local-only passwords for
+# DB_PASSWORD, MIGRATION_DB_PASSWORD and POSTGRES_ADMIN_PASSWORD.
 set -a
 . ./.env
 set +a
@@ -27,88 +27,119 @@ docker compose up -d --wait postgres
 ./mvnw spring-boot:run
 ```
 
-Spring Boot does not automatically load `.env`; export it as above or provide the variables through your IDE. Compose reads it for the database service. Use a shell-safe value such as a randomly generated hex password. Do not paste production credentials into this file.
+Only source a local file you control. Use shell-safe passwords (for example random hex), and keep `.env` untracked. Spring Boot does not automatically read `.env`; Compose does. Changing `POSTGRES_PORT` requires changing `DB_URL` too.
 
-The database publishes only on `127.0.0.1:5433` to avoid an existing service on 5432. `DB_URL` uses database `nexus_local`; changing `POSTGRES_PORT` also requires updating DB_URL and TEST_DB_URL. PostgreSQL first-start credentials are stored in its volume; changing `.env` does not change the password in an existing volume.
+The bootstrap SQL in `ops/postgres/01-roles.sql` runs once when PostgreSQL initializes an empty volume. It creates schema `nexus` and two non-superuser accounts:
 
-The host runs Java and React; Compose runs PostgreSQL only. This is the Phase 1 local-development variant of the system design. A backend image and cloud deployment follow in Phase 11.
-
-Check `http://localhost:8080/actuator/health` for `{"status":"UP"}`. Only health is exposed. All other routes remain protected by Spring Security defaults; there are no business routes or JWT implementation yet. Default generated development authentication is not a V1 login feature and must not be deployed as one.
-
-## Profiles and schema ownership
-
-| Profile | Database configuration | Purpose |
+| Account | Environment | Purpose |
 | --- | --- | --- |
-| local | DB_URL (local default), required DB_USERNAME and DB_PASSWORD | Developer-run application |
-| test | Required TEST_DB_URL, TEST_DB_USERNAME, TEST_DB_PASSWORD | Isolated test database; no local DB fallback |
-| prod | Required DB_URL, DB_USERNAME, DB_PASSWORD; optional DB_POOL_SIZE | External secrets/configuration, graceful shutdown and health probes |
+| `nexus_bootstrap` | `POSTGRES_ADMIN_PASSWORD` | Local PostgreSQL administrator; never use for application connections |
+| `nexus_migrator` | `MIGRATION_DB_USERNAME`, `MIGRATION_DB_PASSWORD` | Owns `nexus`; Flyway DDL and explicit data migrations |
+| `nexus_runtime` | `DB_USERNAME`, `DB_PASSWORD` | Application reads/writes with table/column grants |
 
-Activate one of these profiles explicitly using SPRING_PROFILES_ACTIVE. No credentials are embedded in source. In deployment use a PostgreSQL TLS connection string and secret injection from the platform. The test database must not contain data you need to keep.
+The local bootstrap uses these fixed names; set the example variables accordingly. In a deployed database, an operator must provision equivalent separate roles and a schema owned by the migrator before startup. Runtime must neither own tables nor inherit a privileged role. Role names are trusted deployment configuration, not request input; use simple PostgreSQL identifiers. Renaming the configured runtime role requires a planned privilege migration.
 
-Hibernate uses `validate` in every profile and Open Session in View is disabled. There are no entities or Flyway migrations yet, so a successful Phase 1 startup validates connectivity only and creates no domain tables. Add Flyway and its migrations in Phase 2 before introducing entities. Do not switch back to `ddl-auto=update` to bypass missing migrations.
+Flyway runs before Hibernate validates all 14 entity mappings. Never bypass migration failures with `ddl-auto=update`, automatic baselining, or a database reset. Flyway clean is disabled. Once released, add a new versioned migration instead of editing an applied one.
+
+Check `http://localhost:8080/actuator/health` for `{"status":"UP"}`. Only health is exposed. Spring Security defaults still protect other routes; generated development authentication is not the planned JWT login and is not a deployable V1 authentication feature.
+
+## Existing Phase 1 database or volume
+
+**Do not delete your existing volume.** Docker initialization scripts do not run again on an existing database, and changing `.env` does not change existing account passwords. Phase 2 requires the new roles and `nexus` schema even if Phase 1 already connected successfully.
+
+Back up any data first. Inspect the existing database as its administrator. For a Phase 1 database with no `nexus` schema or these roles, provision them once using the checked-in script. With Compose, after supplying the new password variables in `.env` and recreating the container with `docker compose up -d postgres`, run:
+
+```sh
+# Replace EXISTING_ADMIN with the actual administrator of the existing volume.
+# Its identity/password are not changed by the new Compose configuration.
+docker compose exec -T postgres psql -U EXISTING_ADMIN -d nexus_local -v ON_ERROR_STOP=1 < ops/postgres/01-roles.sql
+```
+
+For native PostgreSQL, export the two password variables and run `psql -U EXISTING_ADMIN -d YOUR_DATABASE -v ON_ERROR_STOP=1 -f ops/postgres/01-roles.sql`. Set DB_URL to that database afterward. The script intentionally fails if roles/schema already exist; inspect and reconcile rather than blindly rerunning or dropping objects. A database with legacy domain tables requires an explicit data/schema migration review: the new `nexus` schema does not import tables from `public`.
+
+## IntelliJ run configuration
+
+Open **Run → Edit Configurations → your existing NexusApplication configuration** (not Configuration Templates). Set Java 21 and these environment variables from your local `.env`:
+
+```text
+SPRING_PROFILES_ACTIVE=local
+DB_URL=jdbc:postgresql://localhost:5433/nexus_local
+DB_USERNAME=nexus_runtime
+DB_PASSWORD=<your runtime password>
+MIGRATION_DB_USERNAME=nexus_migrator
+MIGRATION_DB_PASSWORD=<your migration password>
+```
+
+Use the environment-variable table to enter each separately. PostgreSQL must already be running and the roles/schema provisioned. The bootstrap administrator password belongs to Compose; the application does not need it.
+
+## Profiles and optional fixtures
+
+| Profile | Purpose |
+| --- | --- |
+| `local` | Developer startup with required runtime and migration credentials |
+| `local,local-seed` | Explicit opt-in to synthetic catalog, disabled accounts, address, cart and opening stock |
+| `test` | Integration tests inject disposable PostgreSQL credentials; no developer-database fallback |
+| `prod` | External secrets, TLS-configured DB_URL, graceful shutdown and health probes; migrations only |
+
+Activate exactly the intended profiles. Never combine `prod` with `local-seed` or point the seed profile at a deployed database. Default/prod Flyway locations contain only `db/migration`; fixtures are in `db/dev-seed`. A database seeded for development should remain a development database.
+
+Seed accounts use `example.invalid`, are disabled and have unusable password hashes. They cannot log in. Opening inventory and its movement are inserted together. Reapplying seed SQL does not reset stock, change existing prices or duplicate opening movements. Registration/admin provisioning follows in Phase 3.
+
+The application currently holds separate migration credentials at startup. Production migration execution can move to a deployment step in Phase 11; runtime credentials must retain their restricted grants.
+
+## Persistence conventions
+
+- UUID identifiers; UTC `Instant` timestamps; `@Version` on mutable user/address/product/inventory/cart/item rows.
+- `created_at` and `updated_at` are managed for JPA writes. Future native update commands must update timestamps and increment versions explicitly.
+- Monetary amounts are `bigint` INR paise. `Pricing` performs bounded integer calculations: unit price ≤100000000, quantity ≤99, ≤50 distinct lines, total ≤10000000000. Empty cart subtotal is zero; checkout must reject an empty cart.
+- Foreign keys are mapped as UUIDs, avoiding implicit eager object graphs. Services resolve ownership and joins explicitly. Do not expose entity objects as API DTOs.
+- Financial entries, inventory movements, failed attempts, order items and refunds are append only. Runtime cannot update/delete/truncate them. Order/payment updates are restricted to `status`; immutable columns are marked non-updatable in JPA.
+- Products are deactivated, preserving historical references. Address/cart-item removal is allowed. Idempotency identity is immutable; only response/result fields can be filled by runtime.
+- Composite foreign keys enforce cart/order ownership and payment/refund/order association. Partial unique indexes guard journal and stock movement duplicates.
+- Cross-row totals, full refund amounts, stock-to-movement reconciliation, actor authorization and allowed status transitions require service transactions/locks in later phases. Database row constraints alone do not implement checkout.
+
+Migration order: identity/catalog/cart → purchases/operation histories → runtime grants. There are no blanket privileges for future tables; future migrations must grant explicitly.
 
 ## Tests and build
 
-Create an isolated test database on the disposable local Compose instance:
-
 ```sh
-docker compose exec postgres sh -c 'createdb -U "$POSTGRES_USER" nexus_test'
-# Run once; "already exists" means the test database was previously created.
-# Set TEST_DB_PASSWORD to your local DB_PASSWORD in .env, then re-export .env.
+# Unit tests only (no Docker required):
+./mvnw test
+# Complete build, including PostgreSQL integration tests:
 ./mvnw clean verify
 ```
 
-The context test selects `test` explicitly. `verify` requires all TEST_DB_* variables and an available isolated database. Phase 2 will add dedicated PostgreSQL fixtures and migration tests; this context test alone does not validate transactions.
+Surefire runs `*Test`; Failsafe runs `*IT` during integration-test/verify and fails if no integration tests are discovered. Testcontainers creates a fresh PostgreSQL instance with separate migration/runtime roles and removes it on JVM exit. Docker unavailability fails the build; tests are not silently skipped. No TEST_DB_* variables or manually created test database are needed.
 
-Compile without starting the database:
+Integration fixtures use random IDs and rollback their transactions, including expected SQL failures via savepoints. The optimistic-lock test commits an isolated product that disappears with its disposable container. Tests never truncate existing databases or disable constraints.
 
-```sh
-./mvnw -DskipTests compile
-```
+Coverage includes fresh/repeated migrations, Hibernate validation of all entities, uniqueness/check/FK guards, runtime permissions, rollback, audit timestamps, optimistic conflicts and seed reapplication. Actual concurrent checkout/refund workflows are tested when their services exist.
 
-Start a packaged application after a verified build:
+To start the packaged build with the same application environment:
 
 ```sh
 java -jar target/nexus-0.0.1-SNAPSHOT.jar
 ```
 
-Use the same environment variables as local startup. Never include secrets in command-line flags, logs, screenshots or committed configuration.
+## Stop and intentional local reset
 
-## Stop and reset the local database
+`docker compose stop` retains data. `docker compose down` removes containers/network and retains the named volume.
 
-`docker compose stop` keeps data. `docker compose down` removes the local containers/network but keeps the named volume.
-
-Only when intentionally discarding this project's disposable local data:
+Only if you deliberately intend to discard this project's disposable local database:
 
 ```sh
 docker compose down --volumes
 docker compose up -d --wait postgres
 ```
 
-This deletes both local and test databases in the Compose volume. Never point this procedure at a shared or deployed database. Recreate `nexus_test` afterward. Do not use a reset as a schema migration strategy.
+This destroys that Compose database and reruns bootstrap on a new volume. It is not a migration or routine testing procedure.
 
-## Package boundaries
+## Repository and phase references
 
-`auth`, `address`, `catalog`, `inventory`, `cart`, `order`, `payment`, `refund`, `history` and `common` each contain a package description. Controllers/DTOs/services/repositories will be added only as their phase needs them. Keep common code limited to shared technical conventions; commerce operations belong to their owning features.
+The backend is now its own Git repository, separate from the frontend. Shared documents remain in the adjacent `docs` directory; backend commits do not automatically include them. Keep real environment files, build output and local verification scripts/logs untracked.
 
 See [backend phases](../docs/backend-development-plan.md), [database/API contract](<../docs/NexusCommerce V1 - Database and API Design.md>) and [system design](<../docs/NexusCommerce V1 - System Design.md>).
 
-## Repository and secret boundary
+## Phase 2 verification — 8 October 2026
 
-On 6 October 2026 the backend and shared docs resolve to `/Users/siddhantprasad/Desktop`, whose branch has no commits; neither directory is tracked. The frontend is a separate Git repository. No repository was initialized and nothing was staged or committed during Phase 1.
-
-Intended ownership: backend source and backend CI belong together, and shared `NexusCommerce/docs` must be explicitly tracked by the chosen project repository. Until a project-level or backend-plus-shared-docs layout is authorized, keep these local and do not install backend CI into the frontend-only repository or stage the Desktop parent broadly. Recheck boundaries before any commit.
-
-The original inline database password was removed. No commit of this file was found in the current parent repository. New local databases must use a new password; this work does not change an existing database account or prove a credential was never shared elsewhere.
-
-## Phase 1 verification record
-
-Verified on 6 October 2026 with Java 21.0.10, Maven 3.9.16, Spring Boot 4.1.1 and native PostgreSQL 15.16:
-
-- Compilation and `./mvnw -B clean verify` passed; 1 context test, no failures/errors/skips.
-- Packaged `local` and `prod` profiles returned health UP against a temporary database.
-- Dependency tree has no Spring AI or Bedrock artifacts.
-- Startup created no application tables; all verification services were stopped afterward.
-- Compose configuration validates. Docker daemon was stopped, so container startup/image pull was not tested.
-
-The temporary database used port 55439 and random disposable credentials, separate from the normal local setup. These checks establish a runnable skeleton, not implemented authentication, commerce APIs or migrations.
+`JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw -B clean verify` passed: 3 unit tests and 11 PostgreSQL integration tests, no failures/errors/skips. Packaged local/prod startup passed with health UP and no seeds. Two consecutive local seed startups passed with exactly two disabled fixture accounts. The documented Compose bootstrap was exercised using a new disposable project/volume, then removed. Existing developer databases were untouched.
